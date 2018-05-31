@@ -1,7 +1,10 @@
 package net.corda.node.services.statemachine
 
 import net.corda.core.flows.StateMachineRunId
-import net.corda.core.utilities.loggerFor
+import net.corda.core.internal.VisibleForTesting
+import net.corda.core.utilities.contextLogger
+import net.corda.node.services.FinalityHandler
+import org.hibernate.exception.ConstraintViolationException
 import java.sql.SQLException
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
@@ -9,31 +12,45 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * This hospital consults "staff" to see if they can automatically diagnose and treat flows.
  */
-object StaffedFlowHospital : FlowHospital {
-    private val log = loggerFor<StaffedFlowHospital>()
+class StaffedFlowHospital : FlowHospital {
+    private companion object {
+        private val log = contextLogger()
+    }
 
-    private val staff = listOf(DeadlockNurse, DuplicateInsertSpecialist)
+    private val staff = listOf(DeadlockNurse, DuplicateInsertSpecialist, FinalityDoctor)
 
-    private val patients = ConcurrentHashMap<StateMachineRunId, MedicalHistory>()
-
-    val numberOfPatients = patients.size
+    @VisibleForTesting
+    internal val patients = ConcurrentHashMap<StateMachineRunId, MedicalHistory>()
 
     class MedicalHistory {
         val records: MutableList<Record> = mutableListOf()
 
-        sealed class Record(val suspendCount: Int) {
-            class Admitted(val at: Instant, suspendCount: Int) : Record(suspendCount) {
-                override fun toString() = "Admitted(at=$at, suspendCount=$suspendCount)"
-            }
+        sealed class Record {
+            abstract val at: Instant
+            abstract val suspendCount: Int
 
-            class Discharged(val at: Instant, suspendCount: Int, val by: Staff, val error: Throwable) : Record(suspendCount) {
-                override fun toString() = "Discharged(at=$at, suspendCount=$suspendCount, by=$by)"
-            }
+            data class Admitted(override val at: Instant,
+                                override val suspendCount: Int) : Record()
+
+            data class Discharged(override val at: Instant,
+                                  override val suspendCount: Int,
+                                  val by: List<Staff>,
+                                  val errors: List<Throwable>) : Record()
+
+            data class KeptInForObservation(override val at: Instant,
+                                            override val suspendCount: Int,
+                                            val by: List<Staff>,
+                                            val errors: List<Throwable>) : Record()
+
+            data class NothingWeCanDo(override val at: Instant,
+                                      override val suspendCount: Int) : Record()
         }
 
         fun notDischargedForTheSameThingMoreThan(max: Int, by: Staff): Boolean {
             val lastAdmittanceSuspendCount = (records.last() as MedicalHistory.Record.Admitted).suspendCount
-            return records.filterIsInstance(MedicalHistory.Record.Discharged::class.java).filter { it.by == by && it.suspendCount == lastAdmittanceSuspendCount }.count() <= max
+            return records
+                    .filterIsInstance<MedicalHistory.Record.Discharged>()
+                    .count { by in it.by && it.suspendCount == lastAdmittanceSuspendCount } <= max
         }
 
         override fun toString(): String = "${this.javaClass.simpleName}(records = $records)"
@@ -41,48 +58,49 @@ object StaffedFlowHospital : FlowHospital {
 
     override fun flowErrored(flowFiber: FlowFiber, currentState: StateMachineState, errors: List<Throwable>) {
         log.info("Flow ${flowFiber.id} admitted to hospital in state $currentState")
+
         val medicalHistory = patients.computeIfAbsent(flowFiber.id) { MedicalHistory() }
-        medicalHistory.records += MedicalHistory.Record.Admitted(Instant.now(), currentState.checkpoint.numberOfSuspends)
+        val suspendCount = currentState.checkpoint.numberOfSuspends
+        medicalHistory.records += MedicalHistory.Record.Admitted(Instant.now(), suspendCount)
+
         for ((index, error) in errors.withIndex()) {
             log.info("Flow ${flowFiber.id} has error [$index]", error)
-            if (!errorIsDischarged(flowFiber, currentState, error, medicalHistory)) {
-                // If any error isn't discharged, then we propagate.
-                log.warn("Flow ${flowFiber.id} error was not discharged, propagating.")
-                flowFiber.scheduleEvent(Event.StartErrorPropagation)
+            val diagnoses: Map<Diagnosis, List<Staff>> = staff.groupBy { it.consult(flowFiber, currentState, error, medicalHistory) }
+
+            diagnoses[Diagnosis.DISCHARGE]?.let {
+                log.info("Flow ${flowFiber.id} error discharged from hospital by $it")
+                medicalHistory.records += MedicalHistory.Record.Discharged(Instant.now(), suspendCount, it, errors)
+                flowFiber.scheduleEvent(Event.RetryFlowFromSafePoint)
+                return
+            }
+
+            diagnoses[Diagnosis.OVERNIGHT_OBSERVATION]?.let {
+                log.info("Flow ${flowFiber.id} error kept for overnight observation by $it")
+                medicalHistory.records += MedicalHistory.Record.KeptInForObservation(Instant.now(), suspendCount, it, errors)
+                // No need to do anything. The flow will automatically retry from its checkpoint on node restart
                 return
             }
         }
-        // If all are discharged, retry.
-        flowFiber.scheduleEvent(Event.RetryFlowFromSafePoint)
-    }
 
-    private fun errorIsDischarged(flowFiber: FlowFiber, currentState: StateMachineState, error: Throwable, medicalHistory: MedicalHistory): Boolean {
-        for (staffMember in staff) {
-            val diagnosis = staffMember.consult(flowFiber, currentState, error, medicalHistory)
-            if (diagnosis == Diagnosis.DISCHARGE) {
-                medicalHistory.records += MedicalHistory.Record.Discharged(Instant.now(), currentState.checkpoint.numberOfSuspends, staffMember, error)
-                log.info("Flow ${flowFiber.id} error discharged from hospital by $staffMember")
-                return true
-            }
-        }
-        return false
+        // None of the staff care for these errors so we let them propagate
+        log.info("Flow ${flowFiber.id} error allowed to propagate")
+        medicalHistory.records += MedicalHistory.Record.NothingWeCanDo(Instant.now(), suspendCount)
+        flowFiber.scheduleEvent(Event.StartErrorPropagation)
     }
 
     // It's okay for flows to be cleaned... we fix them now!
-    override fun flowCleaned(flowFiber: FlowFiber) {}
+    override fun flowCleaned(flowFiber: FlowFiber) = Unit
 
     override fun flowRemoved(flowFiber: FlowFiber) {
         patients.remove(flowFiber.id)
     }
 
     enum class Diagnosis {
-        /**
-         * Retry from last safe point.
-         */
+        /** Retry from last safe point. */
         DISCHARGE,
-        /**
-         * Please try another member of staff.
-         */
+        /** Park and await intervention. */
+        OVERNIGHT_OBSERVATION,
+        /** Please try another member of staff. */
         NOT_MY_SPECIALTY
     }
 
@@ -121,7 +139,13 @@ object StaffedFlowHospital : FlowHospital {
         }
 
         private fun mentionsConstraintViolation(exception: Throwable?): Boolean {
-            return exception != null && (exception is org.hibernate.exception.ConstraintViolationException || mentionsConstraintViolation(exception.cause))
+            return exception != null && (exception is ConstraintViolationException || mentionsConstraintViolation(exception.cause))
+        }
+    }
+
+    object FinalityDoctor : Staff {
+        override fun consult(flowFiber: FlowFiber, currentState: StateMachineState, newError: Throwable, history: MedicalHistory): Diagnosis {
+            return if (currentState.flowLogic is FinalityHandler) Diagnosis.OVERNIGHT_OBSERVATION else Diagnosis.NOT_MY_SPECIALTY
         }
     }
 }
