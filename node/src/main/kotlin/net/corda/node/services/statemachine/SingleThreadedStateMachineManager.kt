@@ -308,6 +308,7 @@ class SingleThreadedStateMachineManager(
             mutex.locked { if (flows.containsKey(id)) return@map null }
             val checkpoint = deserializeCheckpoint(serializedCheckpoint)
             if (checkpoint == null) return@map null
+            logger.debug { "Restored $checkpoint" }
             createFlowFromCheckpoint(
                     id = id,
                     checkpoint = checkpoint,
@@ -356,7 +357,10 @@ class SingleThreadedStateMachineManager(
             // Just flow initiation message
             null
         }
-        externalEventMutex.withLock {
+        mutex.locked {
+            if (stopping) {
+                return
+            }
             // Remove any sessions the old flow has.
             for (sessionId in getFlowSessionIds(currentState.checkpoint)) {
                 sessionToFlow.remove(sessionId)
@@ -377,12 +381,13 @@ class SingleThreadedStateMachineManager(
         }
     }
 
-    private val externalEventMutex = ReentrantLock()
     override fun deliverExternalEvent(event: ExternalEvent) {
-        externalEventMutex.withLock {
-            when (event) {
-                is ExternalEvent.ExternalMessageEvent -> onSessionMessage(event)
-                is ExternalEvent.ExternalStartFlowEvent<*> -> onExternalStartFlow(event)
+        mutex.locked {
+            if (!stopping) {
+                when (event) {
+                    is ExternalEvent.ExternalMessageEvent -> onSessionMessage(event)
+                    is ExternalEvent.ExternalStartFlowEvent<*> -> onExternalStartFlow(event)
+                }
             }
         }
     }
